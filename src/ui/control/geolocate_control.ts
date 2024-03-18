@@ -29,6 +29,18 @@ type GeolocateControlOptions = {
      */
     trackUserLocation?: boolean;
     /**
+     * If `true` the `GeolocateControl` will automatically orient to
+     * the GPS heading.
+     * @defaultValue false
+     */
+    trackUserBearing?: boolean;
+    /**
+     * The threshold GPS speed below which the map will not orient
+     * to the GPS heading to avoid thrashing.
+     * @defaultValue 0.5m/s
+     */
+    trackUserBearingSpeedThreshold?: number;
+    /**
      * By default, if `showUserLocation` is `true`, a transparent circle will be drawn around the user location indicating the accuracy (95% confidence level) of the user's location. Set to `false` to disable. Always disabled when `showUserLocation` is `false`.
      * @defaultValue true
      */
@@ -38,6 +50,16 @@ type GeolocateControlOptions = {
      * @defaultValue true
      */
     showUserLocation?: boolean;
+    /**
+     * By default any zoom event will cause the `GeolocateControl`
+     * to go into passive mode. Set this to `true` to ignore identifieable zoom
+     * events.
+     *
+     * Note that this will ignore zoom events from the `NavigationControl` and
+     * mousewheel events but will NOT ignore touch screen 'pinch' gestures,
+     * since these are both zoom and move.
+     */
+    ignoreZoom?: boolean;
 };
 
 const defaultOptions: GeolocateControlOptions = {
@@ -50,12 +72,33 @@ const defaultOptions: GeolocateControlOptions = {
         maxZoom: 15
     },
     trackUserLocation: false,
+    trackUserBearing: false,
+    trackUserBearingSpeedThreshold: 0.5,
     showAccuracyCircle: true,
-    showUserLocation: true
+    showUserLocation: true,
+    ignoreZoom: false,
 };
 
 let numberOfWatches = 0;
 let noTimeout = false;
+
+/* Geolocate Control Watch States
+    * This is the private state of the control.
+    *
+    * OFF
+    *    off/inactive
+    * WAITING_ACTIVE
+    *    Geolocate Control was clicked but still waiting for Geolocation API response with user location
+    * ACTIVE_LOCK
+    *    Showing the user location as a dot AND tracking the camera to be fixed to their location. If their location changes the map moves to follow.
+    * ACTIVE_ERROR
+    *    There was en error from the Geolocation API while trying to show and track the user location.
+    * BACKGROUND
+    *    Showing the user location as a dot but the camera doesn't follow their location as it changes.
+    * BACKGROUND_ERROR
+    *    There was an error from the Geolocation API while trying to show (but not track) the user location.
+*/
+export type WatchState = 'OFF' | 'ACTIVE_LOCK' | 'WAITING_ACTIVE' | 'ACTIVE_ERROR' | 'BACKGROUND' | 'BACKGROUND_ERROR'
 
 /**
  * A `GeolocateControl` control provides a button that uses the browser's geolocation
@@ -202,23 +245,7 @@ export class GeolocateControl extends Evented implements IControl {
     _geolocateButton: HTMLButtonElement;
     _geolocationWatchID: number;
     _timeoutId: ReturnType<typeof setTimeout>;
-    /* Geolocate Control Watch States
-     * This is the private state of the control.
-     *
-     * OFF
-     *    off/inactive
-     * WAITING_ACTIVE
-     *    Geolocate Control was clicked but still waiting for Geolocation API response with user location
-     * ACTIVE_LOCK
-     *    Showing the user location as a dot AND tracking the camera to be fixed to their location. If their location changes the map moves to follow.
-     * ACTIVE_ERROR
-     *    There was en error from the Geolocation API while trying to show and track the user location.
-     * BACKGROUND
-     *    Showing the user location as a dot but the camera doesn't follow their location as it changes.
-     * BACKGROUND_ERROR
-     *    There was an error from the Geolocation API while trying to show (but not track) the user location.
-     */
-    _watchState: 'OFF' | 'ACTIVE_LOCK' | 'WAITING_ACTIVE' | 'ACTIVE_ERROR' | 'BACKGROUND' | 'BACKGROUND_ERROR';
+    _watchState: WatchState;
     _lastKnownPosition: any;
     _userLocationDotMarker: Marker;
     _accuracyCircleMarker: Marker;
@@ -382,7 +409,33 @@ export class GeolocateControl extends Evented implements IControl {
     _updateCamera = (position: GeolocationPosition) => {
         const center = new LngLat(position.coords.longitude, position.coords.latitude);
         const radius = position.coords.accuracy;
-        const bearing = this._map.getBearing();
+
+        // set the bearing, either use the existing bearing
+        // or set from the position information
+        let bearing: number;
+
+        // detect threshold speed, default to the threshold
+        const speed = position.coords.speed ?
+            position.coords.speed :
+            this.options.trackUserBearingSpeedThreshold;
+
+        // if option set, there is heading and the speed is sufficient
+        // track user bearing
+        if (this.options.trackUserBearing &&
+             position.coords.heading &&
+             speed >= this.options.trackUserBearingSpeedThreshold
+        ) {
+            bearing = position.coords.heading;
+        } else {
+            // retain current map bearing
+            bearing = this._map.getBearing();
+        }
+
+        // if `ignoreZoom` set the maxZoom to the current map zoon
+
+        if (this.options.ignoreZoom) {
+            this.options.fitBoundsOptions.maxZoom = this._map.getZoom();
+        }
         const options = extend({bearing}, this.options.fitBoundsOptions);
         const newBounds = LngLatBounds.fromLngLat(center, radius);
 
@@ -519,16 +572,44 @@ export class GeolocateControl extends Evented implements IControl {
             this._map.on('zoom', this._onZoom);
         }
 
-        this._geolocateButton.addEventListener('click', () => this.trigger());
-
+        this._geolocateButton.addEventListener('click', () => {
+            switch (this._watchState) {
+                case 'WAITING_ACTIVE':
+                case 'ACTIVE_LOCK':
+                    this.reset();
+                    break;
+                case 'ACTIVE_ERROR':
+                case 'BACKGROUND':
+                case 'BACKGROUND_ERROR':
+                case 'OFF':
+                    this.trigger();
+                    break;
+                default:
+                    throw new Error(`Unexpected watchState ${this._watchState}`);
+            }
+        });
         this._setup = true;
 
         // when the camera is changed (and it's not as a result of the Geolocation Control) change
         // the watch mode to background watch, so that the marker is updated but not the camera.
         if (this.options.trackUserLocation) {
             this._map.on('movestart', (event: any) => {
-                const fromResize = event.originalEvent && event.originalEvent.type === 'resize';
-                if (!event.geolocateSource && this._watchState === 'ACTIVE_LOCK' && !fromResize) {
+                //if this event is casued by this control, then do nothing
+                if (event.geolocateSource) return;
+
+                //if this event is caused by screen resize, then do nothing
+                if (event[0]) return;
+
+                //if this is a zoom event and ignorZoom is set, then do nothing
+                if (this.options.ignoreZoom &&
+                        event.originalEvent && (
+                    event.originalEvent.type === 'click' ||
+                        event.originalEvent.type === 'wheel'
+                )) return;
+
+                // this is a valid change event, if ACTIVE_LOCK then
+                // change to BACKGROUND
+                if (this._watchState === 'ACTIVE_LOCK') {
                     this._watchState = 'BACKGROUND';
                     this._geolocateButton.classList.add('maplibregl-ctrl-geolocate-background');
                     this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-active');
@@ -538,6 +619,47 @@ export class GeolocateControl extends Evented implements IControl {
             });
         }
     };
+
+    /**
+     * Programatically turn off the `GeolocateControl`
+     * and clean up.
+     *
+     * @example
+     * ```ts
+     * // Reset the geolocate control.
+     * let geolocate = new GeolocateControl({
+     *  positionOptions: {
+     *    enableHighAccuracy: true
+     *  },
+     *  trackUserLocation: true
+     * });
+     * // Add the control to the map.
+     * map.addControl(geolocate);
+     *
+     * ...
+     *
+     * // turn off the geolocate control
+     * geolocate.reset();
+     * ```
+     */
+    reset():void {
+        numberOfWatches--;
+        noTimeout = false;
+        this._watchState = 'OFF';
+        this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-waiting');
+        this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-active');
+        this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-active-error');
+        this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-background');
+        this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-background-error');
+
+        this.fire(new Event('trackuserlocationend'));
+
+        // manage geolocation.watchPosition / geolocation.clearWatch
+        if (this._geolocationWatchID !== undefined) {
+            // clear watchPosition as we've changed to an OFF state
+            this._clearWatch();
+        }
+    }
 
     /**
      * Programmatically request and move the map to the user's location.
@@ -565,7 +687,7 @@ export class GeolocateControl extends Evented implements IControl {
             return false;
         }
         if (this.options.trackUserLocation) {
-            // update watchState and do any outgoing state cleanup
+            // update watchState
             switch (this._watchState) {
                 case 'OFF':
                 // turn on the Geolocate Control
@@ -575,19 +697,12 @@ export class GeolocateControl extends Evented implements IControl {
                     break;
                 case 'WAITING_ACTIVE':
                 case 'ACTIVE_LOCK':
+                // trigger does nothing when active
+                    break;
                 case 'ACTIVE_ERROR':
                 case 'BACKGROUND_ERROR':
                 // turn off the Geolocate Control
-                    numberOfWatches--;
-                    noTimeout = false;
-                    this._watchState = 'OFF';
-                    this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-waiting');
-                    this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-active');
-                    this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-active-error');
-                    this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-background');
-                    this._geolocateButton.classList.remove('maplibregl-ctrl-geolocate-background-error');
-
-                    this.fire(new Event('trackuserlocationend'));
+                    this.reset();
                     break;
                 case 'BACKGROUND':
                     this._watchState = 'ACTIVE_LOCK';
@@ -602,7 +717,11 @@ export class GeolocateControl extends Evented implements IControl {
             }
 
             // incoming state setup
-            switch (this._watchState) {
+            switch (this._watchState as WatchState) {
+                case 'ACTIVE_ERROR':
+                case 'BACKGROUND':
+                case 'BACKGROUND_ERROR':
+                    break;
                 case 'WAITING_ACTIVE':
                     this._geolocateButton.classList.add('maplibregl-ctrl-geolocate-waiting');
                     this._geolocateButton.classList.add('maplibregl-ctrl-geolocate-active');
@@ -610,17 +729,11 @@ export class GeolocateControl extends Evented implements IControl {
                 case 'ACTIVE_LOCK':
                     this._geolocateButton.classList.add('maplibregl-ctrl-geolocate-active');
                     break;
-                case 'OFF':
-                    break;
                 default:
                     throw new Error(`Unexpected watchState ${this._watchState}`);
             }
 
-            // manage geolocation.watchPosition / geolocation.clearWatch
-            if (this._watchState === 'OFF' && this._geolocationWatchID !== undefined) {
-                // clear watchPosition as we've changed to an OFF state
-                this._clearWatch();
-            } else if (this._geolocationWatchID === undefined) {
+            if (this._geolocationWatchID === undefined) {
                 // enable watchPosition since watchState is not OFF and there is no watchPosition already running
 
                 this._geolocateButton.classList.add('maplibregl-ctrl-geolocate-waiting');
